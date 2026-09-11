@@ -5,8 +5,8 @@
             <button
                 type="button"
                 class="kiwi-gm-btn kiwi-gm-btn--icon"
-                :title="$t('kiwi-games:mgmt_refresh')"
-                :disabled="state.loading"
+                :title="state.refreshLocked ? $t('kiwi-games:mgmt_refresh_wait') : $t('kiwi-games:mgmt_refresh')"
+                :disabled="state.loading || state.refreshLocked"
                 @click="refresh"
             >↻</button>
         </div>
@@ -64,8 +64,8 @@
                         <button
                             type="button"
                             class="kiwi-gm-btn kiwi-gm-btn--icon"
-                            :title="$t('kiwi-games:mgmt_refresh')"
-                            :disabled="scoresFor(game.id).loading"
+                            :title="scoresFor(game.id).locked ? $t('kiwi-games:mgmt_refresh_wait') : $t('kiwi-games:mgmt_refresh')"
+                            :disabled="scoresFor(game.id).loading || scoresFor(game.id).locked"
                             @click="refreshScores(game.id)"
                         >↻</button>
                     </div>

@@ -4,10 +4,17 @@ import { GM_TAG } from './constants.js';
 import { decodeJsonBase64Url, encodeJsonBase64Url } from './base64url.js';
 import { channelNamesMatch, nicksMatch } from './network.js';
 import { t } from '../../shared/locales.js';
+import { ensureGameMasterOnline, markGameMasterOnline, markGameMasterOffline } from './bot-presence.js';
 
-const PUSH_OPS = new Set(['lobby.ready', 'lobby.open', 'lobby.kicked', 'lobby.launched', 'start']);
-
-const SALON_REFRESH_DEBOUNCE_MS = 300;
+const PUSH_OPS = new Set([
+    'lobby.ready',
+    'lobby.open',
+    'lobby.kicked',
+    'lobby.launched',
+    'lobby.update',
+    'queue.update',
+    'start',
+]);
 
 function newRequestId() {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -54,23 +61,10 @@ export class GmClient {
     constructor() {
         this.pending = new Map();
         this.bound = false;
-        this.salonUpdateHandler = null;
-        this.salonEventHandler = null;
         this.pushHandler = null;
-        this._salonRefreshTimer = null;
     }
 
-    /** Called (debounced) when a +gm TAGMSG targets the configured salon channel. */
-    setSalonUpdateHandler(handler) {
-        this.salonUpdateHandler = typeof handler === 'function' ? handler : null;
-    }
-
-    /** Immediate salon +gm events (e.g. queue.join announcements). */
-    setSalonEventHandler(handler) {
-        this.salonEventHandler = typeof handler === 'function' ? handler : null;
-    }
-
-    /** Unsolicited bot TAGMSG (lobby.ready / open / kicked / launched / start). */
+    /** Unsolicited bot TAGMSG (queue.update / lobby.* / start). */
     setPushHandler(handler) {
         this.pushHandler = typeof handler === 'function' ? handler : null;
     }
@@ -81,14 +75,12 @@ export class GmClient {
         kiwi.on('irc.tagmsg', (event, network) => {
             this.onTagmsg(event, network);
         });
-    }
-
-    notifySalon(payload, network) {
-        const net = resolveNetwork(network);
-        const irc = net && net.ircClient;
-        const salon = getConfig().salon;
-        if (!irc || !salon || !payload) return false;
-        return sendTagmsg(irc, salon, { [GM_TAG]: encodeJsonBase64Url(payload) });
+        kiwi.on('irc.no such nick', (event, network) => {
+            this.onMissingNick(event, network);
+        });
+        kiwi.on('irc.401', (event, network) => {
+            this.onMissingNick(event, network);
+        });
     }
 
     request(op, fields = {}, network) {
@@ -98,32 +90,50 @@ export class GmClient {
             return Promise.reject(new Error(t('mgmt_err_no_network')));
         }
 
-        const id = newRequestId();
-        const payload = { id, op, ...fields };
-        const encoded = encodeJsonBase64Url(payload);
         const botNick = getConfig().gameMasterNick;
 
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this.pending.delete(id);
-                reject(new Error(t('mgmt_err_timeout', { op })));
-            }, getConfig().requestTimeoutMs);
-
-            this.pending.set(id, {
-                resolve,
-                reject,
-                timer,
-                chunks: new Map(),
-                partsExpected: null,
-            });
-
-            const ok = sendTagmsg(irc, botNick, { [GM_TAG]: encoded });
-            if (!ok) {
-                clearTimeout(timer);
-                this.pending.delete(id);
-                reject(new Error(t('mgmt_err_tagmsg')));
+        return ensureGameMasterOnline(net, botNick).then((online) => {
+            if (!online) {
+                return Promise.reject(new Error(t('mgmt_err_offline', { nick: botNick })));
             }
+
+            const id = newRequestId();
+            const payload = { id, op, ...fields };
+            const encoded = encodeJsonBase64Url(payload);
+
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    this.pending.delete(id);
+                    reject(new Error(t('mgmt_err_timeout', { op, nick: botNick })));
+                }, getConfig().requestTimeoutMs);
+
+                this.pending.set(id, {
+                    resolve,
+                    reject,
+                    timer,
+                    chunks: new Map(),
+                    partsExpected: null,
+                });
+
+                const ok = sendTagmsg(irc, botNick, { [GM_TAG]: encoded });
+                if (!ok) {
+                    clearTimeout(timer);
+                    this.pending.delete(id);
+                    reject(new Error(t('mgmt_err_tagmsg')));
+                }
+            });
         });
+    }
+
+    onMissingNick(event, network) {
+        const missing = event && (event.nick
+            || event.nick_change
+            || (Array.isArray(event.params) && event.params[1]));
+        const botNick = getConfig().gameMasterNick;
+        const irc = network && network.ircClient;
+        if (nicksMatch(missing, botNick, irc)) {
+            markGameMasterOffline(network, botNick);
+        }
     }
 
     onTagmsg(event, network) {
@@ -138,16 +148,15 @@ export class GmClient {
         const target = eventTarget(event);
         const salon = getConfig().salon;
 
+        // Channel +gm is ignored: patches arrive privately. A salon TAGMSG
+        // would otherwise make every plugin client refresh.
         if (channelNamesMatch(target, salon, irc && irc.caseCompare)) {
-            if (this.salonEventHandler) {
-                this.salonEventHandler(network, event, decoded);
-            }
-            this.scheduleSalonRefresh(network);
             return;
         }
 
         const botNick = getConfig().gameMasterNick;
         if (!nicksMatch(event.nick, botNick, irc)) return;
+        markGameMasterOnline(network, botNick);
 
         const id = decoded.id == null ? '' : String(decoded.id);
         const pending = id ? this.pending.get(id) : null;
@@ -186,17 +195,6 @@ export class GmClient {
         }
 
         this.finishOk(id, decoded);
-    }
-
-    scheduleSalonRefresh(network) {
-        if (!this.salonUpdateHandler) return;
-        if (this._salonRefreshTimer) {
-            clearTimeout(this._salonRefreshTimer);
-        }
-        this._salonRefreshTimer = setTimeout(() => {
-            this._salonRefreshTimer = null;
-            this.salonUpdateHandler(network);
-        }, SALON_REFRESH_DEBOUNCE_MS);
     }
 
     finishOk(id, response) {

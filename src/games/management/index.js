@@ -2,7 +2,8 @@ import { setConfig } from './libs/config.js';
 import { defaultConfig } from './libs/constants.js';
 import { GmClient } from './libs/gm-client.js';
 import { initGameStore } from './libs/game-store.js';
-import { activateManagementSalon } from '../shared/reportGameResult.js';
+import { activateManagementSalon, setBotOnlineCheck } from '../shared/reportGameResult.js';
+import { ensureGameMasterOnline } from './libs/bot-presence.js';
 import HeaderGamesButton from './components/HeaderGamesButton.vue';
 
 /**
@@ -12,25 +13,14 @@ import HeaderGamesButton from './components/HeaderGamesButton.vue';
 export function init(kiwi, config) {
     const cfg = { ...defaultConfig, ...config };
     setConfig(cfg);
-    activateManagementSalon(cfg.salon);
+    activateManagementSalon(cfg.salon, cfg.gameMasterNick);
+    setBotOnlineCheck((network, nick) => ensureGameMasterOnline(network, nick));
 
     const client = new GmClient();
     client.bind();
     const store = initGameStore(client);
-    client.setSalonUpdateHandler((network) => {
-        store.refresh(network);
-    });
-    client.setSalonEventHandler((network, event, payload) => {
-        store.handleSalonEvent(network, event, payload);
-    });
     client.setPushHandler((payload, network) => {
         store.handlePush(payload, network);
-    });
-
-    kiwi.on('plugin-kiwi-games.game-started', (ev) => {
-        const net = (ev && ev.network)
-            || (kiwi.state.getActiveNetwork && kiwi.state.getActiveNetwork());
-        if (net) store.refresh(net);
     });
 
     if (cfg.button !== false && typeof kiwi.addUi === 'function') {

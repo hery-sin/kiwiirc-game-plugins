@@ -4,24 +4,34 @@ import { encodeJsonBase64Url } from './base64url.js';
 const GM_TAG = '+gm';
 
 let activeManagementSalon = '';
+let activeGameMasterNick = '';
+let botOnlineCheck = null;
 
-/** Called when the management sub-plugin actually starts (salon from merged config). */
-export function activateManagementSalon(salon) {
+/** Called when the management sub-plugin actually starts. */
+export function activateManagementSalon(salon, gameMasterNick) {
     activeManagementSalon = typeof salon === 'string' ? salon.trim() : '';
+    activeGameMasterNick = typeof gameMasterNick === 'string' ? gameMasterNick.trim() : '';
+}
+
+/** Optional ISON/nicklist gate so we never TAGMSG a missing bot nick. */
+export function setBotOnlineCheck(fn) {
+    botOnlineCheck = typeof fn === 'function' ? fn : null;
 }
 
 /**
- * Salon for game.start / game.result TAGMSG.
- * Set only by management init — empty if management is not in the build,
- * disabled, or started without a salon. Never infers a salon from config alone.
+ * Salon used only as a local buffer for system lines — TAGMSG goes to the bot.
  */
 export function getManagementSalon() {
     return activeManagementSalon;
 }
 
-/** True when management is running and a salon channel is configured. */
+export function getGameMasterNick() {
+    return activeGameMasterNick;
+}
+
+/** True when management is running with a salon and a bot nick. */
 export function isManagementActive() {
-    return Boolean(activeManagementSalon);
+    return Boolean(activeManagementSalon && activeGameMasterNick);
 }
 
 function sendTagmsg(ircClient, target, tags) {
@@ -57,19 +67,27 @@ function uniqueNicks(list) {
     return out;
 }
 
-function salonTagmsg(network, payload) {
-    const salon = getManagementSalon();
-    if (!salon || !payload) return;
+function botTagmsg(network, payload) {
+    const botNick = getGameMasterNick();
+    if (!isManagementActive() || !botNick || !payload) return;
     const net = network || (kiwi.state.getActiveNetwork && kiwi.state.getActiveNetwork());
     const irc = net && net.ircClient;
     if (!irc) return;
-    sendTagmsg(irc, salon, { [GM_TAG]: encodeJsonBase64Url(payload) });
+
+    const send = () => {
+        sendTagmsg(irc, botNick, { [GM_TAG]: encodeJsonBase64Url(payload) });
+    };
+
+    if (!botOnlineCheck) return;
+
+    Promise.resolve(botOnlineCheck(net, botNick)).then((online) => {
+        if (online) send();
+    }).catch(() => {});
 }
 
 /**
  * Tell gameMaster that these nicks started a match, so they leave all queues
- * and lobbies. Sends TAGMSG +gm game.start to the salon only when management
- * is active (a salon was configured and the sub-plugin started).
+ * and lobbies. Private TAGMSG +gm game.start to the bot (never the salon).
  * Sender must be one of `players`.
  *
  * @param {object} network
@@ -87,7 +105,7 @@ export function announceGameStart(network, result) {
 
     if (!isManagementActive() || !game || players.length === 0) return;
 
-    salonTagmsg(network, {
+    botTagmsg(network, {
         op: 'game.start',
         game,
         players,
@@ -95,10 +113,9 @@ export function announceGameStart(network, result) {
 }
 
 /**
- * Emit analytics event and, if a management salon is configured, broadcast
- * TAGMSG +gm game.result to that channel.
- * Every participant may send the same result; the bot is expected to dedupe
- * and validate NickServ accounts.
+ * Emit analytics event and, if management is active, send TAGMSG +gm
+ * game.result privately to the bot. Do not broadcast to the salon:
+ * every plugin client in the channel would see it and refresh.
  *
  * @param {object} network
  * @param {{ game: string, players: string[], winner: string|null }} result
@@ -118,7 +135,7 @@ export function completeGame(network, result) {
 
     if (!isManagementActive() || !game) return;
 
-    salonTagmsg(network, {
+    botTagmsg(network, {
         op: 'game.result',
         game,
         players: players.slice(),

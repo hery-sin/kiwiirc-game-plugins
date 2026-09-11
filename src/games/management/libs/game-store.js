@@ -1,9 +1,12 @@
 /* global kiwi:true */
 import { GAME_IDS, GAME_LABELS } from './constants.js';
 import { getConfig } from './config.js';
-import { addChannelSystemMessage, nicksMatch } from './network.js';
+import { addChannelSystemMessage } from './network.js';
 import { t } from '../../shared/locales.js';
 import { isGameEnabled } from '../../shared/pluginConfig.js';
+
+const REFRESH_COOLDOWN_MS = 8000;
+const SCORES_COOLDOWN_MS = 8000;
 
 function emptyGames() {
     return GAME_IDS.filter((id) => isGameEnabled(id)).map((id) => ({
@@ -32,6 +35,7 @@ function createInitialState() {
         scoresOpenGame: '',
         scoresByGame: {},
         lastUpdated: 0,
+        refreshLocked: false,
         queueInviteLocked: false,
     };
 }
@@ -56,6 +60,7 @@ function emptyScoresState() {
         top: [],
         me: null,
         fetchedAt: 0,
+        locked: false,
     };
 }
 
@@ -63,12 +68,40 @@ function asObject(data) {
     return data && typeof data === 'object' ? data : {};
 }
 
+function playerNick(p) {
+    if (typeof p === 'string') return p.trim();
+    return String((p && p.nick) || (p && p.account) || '').trim();
+}
+
 function normalizePlayer(p) {
+    if (typeof p === 'string') {
+        return { account: '', nick: p.trim(), joinedAt: '' };
+    }
     return {
         account: String((p && p.account) || ''),
-        nick: String((p && p.nick) || (p && p.account) || ''),
+        nick: playerNick(p),
         joinedAt: String((p && p.joinedAt) || ''),
     };
+}
+
+function lobbyPlayerNicks(source) {
+    if (!source) return [];
+    if (Array.isArray(source.players)) {
+        return source.players.map(playerNick).filter(Boolean);
+    }
+    if (Array.isArray(source.nicks)) {
+        return source.nicks.map((n) => String(n || '').trim()).filter(Boolean);
+    }
+    return [];
+}
+
+function compactPlayerNicks(players) {
+    if (!Array.isArray(players)) return null;
+    const nicks = players
+        .filter((p) => typeof p === 'string')
+        .map((p) => p.trim())
+        .filter(Boolean);
+    return nicks;
 }
 
 function normalizeLobby(l) {
@@ -116,7 +149,9 @@ export class GameStore {
         this.refreshSeq = 0;
         this._queueInviteUnlockTimer = null;
         this._refreshInFlight = null;
-        this._refreshQueued = null;
+        this._refreshNetwork = null;
+        this._unlockRefreshTimer = null;
+        this._unlockScoresTimers = {};
     }
 
     setExpanded(gameId) {
@@ -140,14 +175,35 @@ export class GameStore {
         await this.fetchScores(gameId, network);
     }
 
+    lockScores(gameId) {
+        const prev = this.scoresFor(gameId);
+        this.state.scoresByGame = {
+            ...this.state.scoresByGame,
+            [gameId]: { ...prev, locked: true },
+        };
+        if (this._unlockScoresTimers[gameId]) {
+            clearTimeout(this._unlockScoresTimers[gameId]);
+        }
+        this._unlockScoresTimers[gameId] = setTimeout(() => {
+            const current = this.scoresFor(gameId);
+            this.state.scoresByGame = {
+                ...this.state.scoresByGame,
+                [gameId]: { ...current, locked: false },
+            };
+            delete this._unlockScoresTimers[gameId];
+        }, SCORES_COOLDOWN_MS);
+    }
+
     async fetchScores(gameId, network) {
         if (!gameId) return;
 
         const prev = this.scoresFor(gameId);
+        if (prev.loading || prev.locked) return;
+        this.lockScores(gameId);
         this.state.scoresByGame = {
             ...this.state.scoresByGame,
             [gameId]: {
-                ...prev,
+                ...this.scoresFor(gameId),
                 loading: true,
                 error: '',
             },
@@ -183,6 +239,7 @@ export class GameStore {
                     top,
                     me,
                     fetchedAt: Date.now(),
+                    locked: true,
                 },
             };
         } catch (err) {
@@ -236,74 +293,116 @@ export class GameStore {
         return this.state.meLobbies.includes(lobbyId);
     }
 
-    handleSalonEvent(network, event, payload) {
-        const op = payload && payload.op;
-        if (op !== 'queue.join') return;
-
-        const gameId = payload.game && String(payload.game);
-        const nick = event && event.nick;
-        if (!gameId || !nick) return;
-
-        const irc = network && network.ircClient;
-        if (nicksMatch(nick, network && network.nick, irc)) return;
-        if (!this.isInQueue(gameId)) return;
-
-        postSalon(network, t('mgmt_queue_peer', {
-            nick,
-            game: gameDisplayName(gameId),
-        }));
-    }
-
     handlePush(payload, network) {
         const op = payload && payload.op;
         const data = asObject(payload && payload.data);
+
+        if (op === 'queue.update') {
+            this.applyQueuePatch(data);
+            const nick = data.nick && String(data.nick);
+            if (data.action === 'joined' && nick) {
+                postSalon(network, t('mgmt_queue_peer', {
+                    nick,
+                    game: gameDisplayName(data.game),
+                }));
+            }
+            return;
+        }
+
+        if (op === 'lobby.update') {
+            this.applyLobbyUpdate(data);
+            return;
+        }
+
         const lobby = asObject(data.lobby);
         const { id, game } = lobbyEventLabel(lobby, data.lobbyId);
 
-        let message = '';
         if (op === 'lobby.ready') {
-            message = t('mgmt_push_ready', { id, game });
-        } else if (op === 'lobby.open') {
-            message = t('mgmt_push_open', { id, game });
-        } else if (op === 'lobby.kicked') {
-            message = t('mgmt_push_kicked', { id, game });
-        } else if (op === 'lobby.launched') {
-            message = t('mgmt_push_launched', { id, game });
-        } else if (op === 'start') {
-            message = t('mgmt_push_start');
+            if (lobby.id) this.upsertLobby(lobby);
+            postSalon(network, t('mgmt_push_ready', { id, game }));
+            return;
         }
+        if (op === 'lobby.open') {
+            this.applyLobbyUpdate({
+                id: data.id || data.lobbyId,
+                game: data.game,
+                status: data.status || 'open',
+                players: data.players,
+            });
+            const { id, game } = lobbyEventLabel(
+                { game: data.game },
+                data.id || data.lobbyId,
+            );
+            postSalon(network, t('mgmt_push_open', { id, game: game || gameDisplayName(data.game) }));
+            return;
+        }
+        if (op === 'lobby.kicked') {
+            const kickedId = data.lobbyId || data.id;
+            this.removeMeLobby(kickedId);
+            this.removeLobby(kickedId, data.game);
+            postSalon(network, t('mgmt_push_kicked', {
+                id: kickedId,
+                game: gameDisplayName(data.game),
+            }));
+            return;
+        }
+        if (op === 'lobby.launched') {
+            const launchedId = data.lobbyId || data.id;
+            const existing = this.findLobby(launchedId);
+            const nicks = lobbyPlayerNicks(existing);
+            this.removeLobby(launchedId, (existing && existing.game) || data.game);
+            this.removeMeLobby(launchedId);
+            this.removeNicksFromQueues(nicks);
+            postSalon(network, t('mgmt_push_launched', {
+                id: launchedId,
+                game: (existing && existing.label) || gameDisplayName(data.game || (existing && existing.game)),
+            }));
+            return;
+        }
+        if (op === 'start') {
+            const nicks = []
+                .concat(data.removed || [])
+                .concat(data.nicks || [])
+                .filter(Boolean);
+            (data.lobbies || []).forEach((lobbyId) => this.removeLobby(String(lobbyId)));
+            this.removeNicksFromQueues(nicks);
+            postSalon(network, t('mgmt_push_start'));
+        }
+    }
 
-        if (message) postSalon(network, message);
-        this.refresh(network);
+    lockRefresh() {
+        this.state.refreshLocked = true;
+        if (this._unlockRefreshTimer) clearTimeout(this._unlockRefreshTimer);
+        this._unlockRefreshTimer = setTimeout(() => {
+            this.state.refreshLocked = false;
+            this._unlockRefreshTimer = null;
+        }, REFRESH_COOLDOWN_MS);
     }
 
     refresh(network) {
-        this._refreshQueued = network || this._refreshQueued;
         if (this._refreshInFlight) {
             return this._refreshInFlight;
         }
+        if (this.state.refreshLocked) {
+            return Promise.resolve();
+        }
+
+        this.lockRefresh();
+        this._refreshNetwork = network || this._refreshNetwork;
+        this.state.loading = true;
         this._refreshInFlight = this._refreshNow().finally(() => {
+            this.state.loading = false;
             this._refreshInFlight = null;
-            if (this._refreshQueued) {
-                const queued = this._refreshQueued;
-                this._refreshQueued = null;
-                return this.refresh(queued);
-            }
-            return undefined;
         });
         return this._refreshInFlight;
     }
 
     async _refreshNow() {
-        const network = this._refreshQueued;
-        this._refreshQueued = null;
+        const network = this._refreshNetwork;
         const seq = ++this.refreshSeq;
 
         try {
-            const [stateRes, meRes] = await Promise.all([
-                this.client.request('state', {}, network),
-                this.client.request('me', {}, network).catch(() => null),
-            ]);
+            const stateRes = await this.client.request('state', {}, network);
 
             if (seq !== this.refreshSeq) return;
 
@@ -312,10 +411,13 @@ export class GameStore {
                 return;
             }
 
-            this.applyState(asObject(stateRes.data));
+            const data = asObject(stateRes.data);
+            this.applyState(data);
 
-            if (meRes && meRes.ok) {
-                this.applyMe(asObject(meRes.data));
+            if (!data.me) {
+                const meRes = await this.client.request('me', {}, network).catch(() => null);
+                if (seq !== this.refreshSeq) return;
+                if (meRes && meRes.ok) this.applyMe(asObject(meRes.data));
             }
 
             this.state.lastUpdated = Date.now();
@@ -362,32 +464,235 @@ export class GameStore {
             const res = await this.client.request(op, fields, network);
             if (!res.ok) {
                 this.state.error = res.error || t('mgmt_err_op', { op });
-                await this.refresh(network);
                 return false;
             }
 
-            if (
-                (op === 'lobby.join' || op === 'lobby.create')
-                && res.data
-                && res.data.lobby
-                && res.data.lobby.status === 'ready'
-            ) {
-                const { id, game } = lobbyEventLabel(res.data.lobby);
-                postSalon(network, t('mgmt_push_ready', { id, game }));
-            }
-
-            if (op === 'lobby.launch' && res.data && res.data.lobby) {
-                const { id, game } = lobbyEventLabel(res.data.lobby);
-                postSalon(network, t('mgmt_push_launched', { id, game }));
-            }
-
-            await this.refresh(network);
-            this.client.notifySalon({ op, ...fields }, network);
+            this.applyMutation(op, fields, asObject(res.data), network);
             return true;
         } catch (err) {
             this.state.error = err instanceof Error ? err.message : String(err);
             return false;
         }
+    }
+
+    applyMutation(op, fields, data, network) {
+        if (op === 'queue.join' || op === 'queue.leave') {
+            this.applyQueuePatch(data, op === 'queue.join' ? 'joined' : 'left');
+            return;
+        }
+
+        if (op === 'lobby.create' || op === 'lobby.join') {
+            const lobby = data.lobby;
+            if (lobby) {
+                this.upsertLobby(lobby);
+                this.addMeLobby(lobby.id);
+                if (lobby.status === 'ready') {
+                    const { id, game } = lobbyEventLabel(lobby);
+                    postSalon(network, t('mgmt_push_ready', { id, game }));
+                }
+            }
+            return;
+        }
+
+        if (op === 'lobby.leave') {
+            if (data.closed) {
+                this.removeLobby(data.lobbyId || data.id || fields.lobby, data.game);
+            } else if (data.lobby) {
+                this.upsertLobby(data.lobby);
+            } else {
+                this.applyLobbyUpdate(data);
+            }
+            this.removeMeLobby(data.lobbyId || data.id || (data.lobby && data.lobby.id) || fields.lobby);
+            return;
+        }
+
+        if (op === 'lobby.kick') {
+            if (data.lobby) this.upsertLobby(data.lobby);
+            return;
+        }
+
+        if (op === 'lobby.launch') {
+            const lobby = asObject(data.lobby);
+            const id = lobby.id || fields.lobby;
+            const nicks = (lobby.players || []).map((p) => p.nick).filter(Boolean);
+            this.removeLobby(id, lobby.game);
+            this.removeMeLobby(id);
+            this.removeNicksFromQueues(nicks);
+            if (lobby.id || id) {
+                const { id: lid, game } = lobbyEventLabel(lobby, id);
+                postSalon(network, t('mgmt_push_launched', { id: lid, game }));
+            }
+        }
+    }
+
+    applyQueuePatch(data, selfAction) {
+        const gameId = data && data.game && String(data.game);
+        if (!gameId) return;
+
+        const action = selfAction || data.action;
+        const nick = data.nick ? String(data.nick) : (selfAction && this.state.meNick) || '';
+        if (!action || !nick) return;
+
+        if (selfAction && nick && !this.state.meNick) {
+            this.state.meNick = nick;
+        }
+
+        let list = (this.state.queues[gameId] || []).slice();
+        const key = nick.toLowerCase();
+        if (action === 'joined') {
+            if (!list.some((p) => String(p.nick || '').toLowerCase() === key)) {
+                list.push(normalizePlayer({ nick }));
+            }
+        } else if (action === 'left') {
+            list = list.filter((p) => String(p.nick || '').toLowerCase() !== key);
+        } else {
+            return;
+        }
+
+        this.state.queues = { ...this.state.queues, [gameId]: list };
+
+        const queueCount = typeof data.queueCount === 'number' ? data.queueCount : list.length;
+        this.patchGameMeta(gameId, { queueCount });
+
+        if (selfAction === 'joined') this.addMeQueue(gameId);
+        if (selfAction === 'left') this.removeMeQueue(gameId);
+        this.syncMeQueuesFromLists();
+    }
+
+    applyLobbyUpdate(data) {
+        const id = data.id || data.lobbyId;
+        const game = data.game;
+
+        if (data.closed) {
+            this.removeLobby(id, game);
+            this.removeMeLobby(id);
+            return;
+        }
+
+        this.patchLobby({
+            id,
+            game,
+            status: data.status,
+            players: data.players,
+        }, game);
+    }
+
+    findLobby(lobbyId) {
+        const id = String(lobbyId || '');
+        if (!id) return null;
+        return this.state.lobbiesOpen.concat(this.state.lobbiesReady)
+            .find((l) => l.id === id) || null;
+    }
+
+    patchLobby(patch, fallbackGame) {
+        const id = String((patch && (patch.id || patch.lobbyId)) || '');
+        if (!id) return;
+        const existing = this.findLobby(id);
+        const nickList = compactPlayerNicks(patch.players);
+        const players = nickList
+            ? nickList.map((nick) => normalizePlayer(nick))
+            : ((existing && existing.players) || []);
+        this.upsertLobby({
+            ...(existing || {}),
+            id,
+            game: patch.game || fallbackGame || (existing && existing.game) || '',
+            label: (existing && existing.label) || '',
+            maxPlayers: (existing && existing.maxPlayers) || 2,
+            status: patch.status || (existing && existing.status) || 'open',
+            createdBy: (existing && existing.createdBy) || '',
+            createdAt: (existing && existing.createdAt) || '',
+            completedAt: existing && existing.completedAt,
+            launchCommand: (existing && existing.launchCommand) || '',
+            players,
+        });
+    }
+
+    upsertLobby(raw) {
+        const lobby = normalizeLobby(raw);
+        if (!lobby.id) return;
+        this.state.lobbiesOpen = this.state.lobbiesOpen.filter((l) => l.id !== lobby.id);
+        this.state.lobbiesReady = this.state.lobbiesReady.filter((l) => l.id !== lobby.id);
+        if (lobby.status === 'ready') {
+            this.state.lobbiesReady = this.state.lobbiesReady.concat([lobby]);
+        } else {
+            this.state.lobbiesOpen = this.state.lobbiesOpen.concat([lobby]);
+        }
+        this.recountOpenLobbies(lobby.game);
+    }
+
+    removeLobby(lobbyId, gameId) {
+        const id = String(lobbyId || '');
+        if (!id) return;
+        const previous = this.state.lobbiesOpen.concat(this.state.lobbiesReady)
+            .find((l) => l.id === id);
+        const game = gameId || (previous && previous.game) || '';
+        this.state.lobbiesOpen = this.state.lobbiesOpen.filter((l) => l.id !== id);
+        this.state.lobbiesReady = this.state.lobbiesReady.filter((l) => l.id !== id);
+        if (game) this.recountOpenLobbies(game);
+    }
+
+    patchGameMeta(gameId, fields) {
+        this.state.games = this.state.games.map((g) => (
+            g.id === gameId ? { ...g, ...fields } : g
+        ));
+    }
+
+    recountOpenLobbies(gameId) {
+        if (!gameId) return;
+        const openLobbies = this.state.lobbiesOpen.filter((l) => l.game === gameId).length;
+        this.patchGameMeta(gameId, { openLobbies });
+    }
+
+    addMeQueue(gameId) {
+        const id = String(gameId || '');
+        if (!id || this.state.meQueues.includes(id)) return;
+        this.state.meQueues = this.state.meQueues.concat([id]);
+    }
+
+    removeMeQueue(gameId) {
+        const id = String(gameId || '');
+        this.state.meQueues = this.state.meQueues.filter((g) => g !== id);
+    }
+
+    addMeLobby(lobbyId) {
+        const id = String(lobbyId || '');
+        if (!id || this.state.meLobbies.includes(id)) return;
+        this.state.meLobbies = this.state.meLobbies.concat([id]);
+    }
+
+    removeMeLobby(lobbyId) {
+        const id = String(lobbyId || '');
+        if (!id) return;
+        this.state.meLobbies = this.state.meLobbies.filter((l) => l !== id);
+    }
+
+    removeNicksFromQueues(nicks) {
+        const keys = new Set(
+            (nicks || []).map((n) => String(n || '').toLowerCase()).filter(Boolean)
+        );
+        if (!keys.size) return;
+
+        const queues = { ...this.state.queues };
+        Object.keys(queues).forEach((gameId) => {
+            const prev = queues[gameId] || [];
+            const next = prev.filter((p) => !keys.has(String(p.nick || '').toLowerCase()));
+            if (next.length !== prev.length) {
+                queues[gameId] = next;
+                this.patchGameMeta(gameId, { queueCount: next.length });
+            }
+        });
+        this.state.queues = queues;
+        this.syncMeQueuesFromLists();
+    }
+
+    syncMeQueuesFromLists() {
+        const myNick = String(this.state.meNick || '').toLowerCase();
+        if (!myNick) return;
+        this.state.meQueues = Object.keys(this.state.queues).filter((gameId) => (
+            (this.state.queues[gameId] || []).some(
+                (p) => String(p.nick || '').toLowerCase() === myNick
+            )
+        ));
     }
 
     applyState(data) {
@@ -422,6 +727,10 @@ export class GameStore {
         this.state.lobbiesReady = Array.isArray(data.lobbies && data.lobbies.ready)
             ? data.lobbies.ready.map(normalizeLobby)
             : [];
+
+        if (data.me && typeof data.me === 'object') {
+            this.applyMe(data.me);
+        }
     }
 
     applyMe(data) {
@@ -433,6 +742,7 @@ export class GameStore {
             : [];
     }
 }
+
 
 let storeInstance = null;
 
